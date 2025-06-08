@@ -267,6 +267,8 @@ private fun ServiceControlCard(
     onStartService: () -> Unit,
     onStopService: () -> Unit
 ) {
+    val context = LocalContext.current
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -290,9 +292,7 @@ private fun ServiceControlCard(
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onTertiaryContainer
                 )
-
                 Spacer(modifier = Modifier.width(8.dp))
-
                 Box(
                     modifier = Modifier
                         .size(12.dp)
@@ -312,7 +312,15 @@ private fun ServiceControlCard(
                 horizontalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 Button(
-                    onClick = onStartService,
+                    onClick = {
+                        try {
+                            val intent = Intent(context, VolumeOverlayService::class.java)
+                            context.startForegroundService(intent)
+                            android.util.Log.d("MainActivity", "Started VolumeOverlayService")
+                        } catch (e: Exception) {
+                            android.util.Log.e("MainActivity", "Failed to start service", e)
+                        }
+                    },
                     modifier = Modifier.weight(1f),
                     enabled = !isServiceRunning
                 ) {
@@ -320,7 +328,23 @@ private fun ServiceControlCard(
                 }
 
                 OutlinedButton(
-                    onClick = onStopService,
+                    onClick = {
+                        try {
+                            // Send stop action to service
+                            val stopIntent = Intent(context, VolumeOverlayService::class.java).apply {
+                                action = "STOP_SERVICE"
+                            }
+                            context.startService(stopIntent)
+
+                            // Also stop service directly
+                            val intent = Intent(context, VolumeOverlayService::class.java)
+                            context.stopService(intent)
+
+                            android.util.Log.d("MainActivity", "Stopped VolumeOverlayService")
+                        } catch (e: Exception) {
+                            android.util.Log.e("MainActivity", "Failed to stop service", e)
+                        }
+                    },
                     modifier = Modifier.weight(1f),
                     enabled = isServiceRunning
                 ) {
@@ -413,3 +437,4 @@ private fun AppInfoCard() {
         }
     }
 }
+

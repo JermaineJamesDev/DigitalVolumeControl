@@ -57,17 +57,9 @@
             android:name="android.support.PARENT_ACTIVITY"
             android:value=".MainActivity" />
 
-        <activity
-            android:name=".LockScreenActivity"
-            android:excludeFromRecents="true"
-            android:exported="false"
-            android:screenOrientation="portrait"
-            android:showWhenLocked="true"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar"
-            android:turnScreenOn="true" />
     </application>
     <uses-sdk
-        android:minSdkVersion="29"
+        android:minSdkVersion="30"
         android:targetSdkVersion="36" />
 
     <uses-feature

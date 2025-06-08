@@ -6,7 +6,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
@@ -14,14 +13,13 @@ import android.media.AudioManager
 import android.os.Build
 import android.os.IBinder
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
 import android.view.WindowManager
-import android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
-import androidx.compose.animation.*
-import androidx.compose.animation.core.*
+import kotlin.math.abs
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -38,13 +36,13 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -54,19 +52,15 @@ import androidx.savedstate.SavedStateRegistry
 import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import com.jpdjdev.digitalvolumecontrol.ui.FloatingVolumeTheme
-import com.jpdjdev.digitalvolumecontrol.ui.GlassTheme
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlin.math.roundToInt
+import kotlin.math.abs
 
-/**
- * Service that displays a floating volume control widget.
- * Includes proper lifecycle management for ComposeView.
- */
-class VolumeOverlayService : Service(), LifecycleOwner, ViewModelStoreOwner,
-    SavedStateRegistryOwner {
+class VolumeOverlayService : Service(), LifecycleOwner, ViewModelStoreOwner, SavedStateRegistryOwner {
+
     companion object {
         var isRunning = false
             private set
@@ -78,44 +72,44 @@ class VolumeOverlayService : Service(), LifecycleOwner, ViewModelStoreOwner,
     private lateinit var overlayView: ComposeView
     private lateinit var audioManager: AudioManager
     private lateinit var windowParams: WindowManager.LayoutParams
-
-    // Lifecycle management
     private lateinit var lifecycleRegistry: LifecycleRegistry
     private lateinit var savedStateRegistryController: SavedStateRegistryController
     private val _viewModelStore = ViewModelStore()
+    private var volumeUpdateJob: Job? = null
 
-    // Lifecycle interfaces
     override val lifecycle: Lifecycle get() = lifecycleRegistry
     override val savedStateRegistry: SavedStateRegistry get() = savedStateRegistryController.savedStateRegistry
     override val viewModelStore: ViewModelStore get() = _viewModelStore
 
     override fun onCreate() {
         super.onCreate()
+        android.util.Log.d("VolumeOverlayService", "Service onCreate")
         isRunning = true
 
-        // Initialize lifecycle components
         lifecycleRegistry = LifecycleRegistry(this)
         savedStateRegistryController = SavedStateRegistryController.create(this)
-
-        // Perform lifecycle transitions
         savedStateRegistryController.performRestore(null)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
 
-        // Initialize system services
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-        // Create notification channel and start foreground service
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification())
-
-        // Set up the overlay view
         setupOverlayView()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        android.util.Log.d("VolumeOverlayService", "onStartCommand: ${intent?.action}")
+
+        if (intent?.action == "STOP_SERVICE") {
+            android.util.Log.d("VolumeOverlayService", "Received STOP_SERVICE action")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         return START_STICKY
     }
 
@@ -128,7 +122,6 @@ class VolumeOverlayService : Service(), LifecycleOwner, ViewModelStoreOwner,
             description = "Floating volume control widget service"
             setShowBadge(false)
         }
-
         val notificationManager = getSystemService(NotificationManager::class.java)
         notificationManager.createNotificationChannel(channel)
     }
@@ -156,54 +149,110 @@ class VolumeOverlayService : Service(), LifecycleOwner, ViewModelStoreOwner,
 
     @SuppressLint("ClickableViewAccessibility")
     private fun setupOverlayView() {
-        // Configure window parameters
         windowParams = WindowManager.LayoutParams().apply {
             width = WindowManager.LayoutParams.WRAP_CONTENT
             height = WindowManager.LayoutParams.WRAP_CONTENT
-            type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            } else {
-                @Suppress("DEPRECATION")
-                WindowManager.LayoutParams.TYPE_PHONE
-            }
+            type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-                    WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
-                    FLAG_TURN_SCREEN_ON
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
             format = PixelFormat.TRANSLUCENT
             gravity = Gravity.TOP or Gravity.START
             x = 100
             y = 200
         }
 
-        // Create ComposeView
         overlayView = ComposeView(this).apply {
-            // Set up ViewTree owners for Compose to work in Service context
             setupViewTreeOwners()
 
-            setContent {
-                FloatingVolumeTheme {
-                    FloatingVolumeWidget(
-                        audioManager = audioManager,
-                        onDrag = { deltaX, deltaY ->
-                            windowParams.x += deltaX.roundToInt()
-                            windowParams.y += deltaY.roundToInt()
+            // Simple touch handling
+            var startX = 0f
+            var startY = 0f
+            var isDragging = false
+            var hasMoved = false
+
+            setOnTouchListener { _, event ->
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        startX = event.rawX
+                        startY = event.rawY
+                        isDragging = true
+                        hasMoved = false
+                        true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (isDragging) {
+                            val deltaX = event.rawX - startX
+                            val deltaY = event.rawY - startY
+
+                            if (abs(deltaX) > 10 || abs(deltaY) > 10) {
+                                hasMoved = true
+                                windowParams.x += deltaX.toInt()
+                                windowParams.y += deltaY.toInt()
+
+                                // Keep within screen bounds using modern API
+                                val windowMetrics = windowManager.currentWindowMetrics
+                                val bounds = windowMetrics.bounds
+                                val screenWidth = bounds.width()
+                                val screenHeight = bounds.height()
+
+                                windowParams.x = windowParams.x.coerceIn(0, screenWidth - 200)
+                                windowParams.y = windowParams.y.coerceIn(0, screenHeight - 200)
+
+                                try {
+                                    windowManager.updateViewLayout(this, windowParams)
+                                } catch (e: Exception) {
+                                    android.util.Log.e("VolumeOverlayService", "Error updating layout", e)
+                                }
+
+                                startX = event.rawX
+                                startY = event.rawY
+                            }
+                        }
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        if (isDragging && hasMoved) {
+                            // Snap to sides using modern API
+                            val windowMetrics = windowManager.currentWindowMetrics
+                            val bounds = windowMetrics.bounds
+                            val screenWidth = bounds.width()
+                            val snapX = if (windowParams.x < screenWidth / 2) {
+                                16 // Left side
+                            } else {
+                                screenWidth - 200 // Right side
+                            }
+                            windowParams.x = snapX
                             try {
                                 windowManager.updateViewLayout(this, windowParams)
                             } catch (e: Exception) {
-                                e.printStackTrace()
+                                android.util.Log.e("VolumeOverlayService", "Error snapping", e)
                             }
+                        }
+                        isDragging = false
+                        !hasMoved // Return false if we moved (don't trigger click)
+                    }
+                    else -> false
+                }
+            }
+
+            setContent {
+                FloatingVolumeTheme {
+                    SimpleVolumeWidget(
+                        audioManager = audioManager,
+                        onOpenMainApp = {
+                            val intent = Intent(this@VolumeOverlayService, MainActivity::class.java).apply {
+                                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                            }
+                            startActivity(intent)
                         }
                     )
                 }
             }
         }
 
-        // Add view to window
         try {
             windowManager.addView(overlayView, windowParams)
-            android.util.Log.d("VolumeOverlayService", "Overlay view added successfully. Lock screen display enabled.")
+            android.util.Log.d("VolumeOverlayService", "Simple overlay view added successfully")
         } catch (e: Exception) {
             android.util.Log.e("VolumeOverlayService", "Failed to add overlay view", e)
             stopSelf()
@@ -211,34 +260,45 @@ class VolumeOverlayService : Service(), LifecycleOwner, ViewModelStoreOwner,
     }
 
     override fun onDestroy() {
+        android.util.Log.d("VolumeOverlayService", "Service onDestroy")
+
+        // Cancel any running jobs
+        volumeUpdateJob?.cancel()
+
+        // Mark as not running first
         isRunning = false
 
-        // Handle lifecycle destruction
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+        // Clean up lifecycle
+        try {
+            lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+            lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+            lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+        } catch (e: Exception) {
+            android.util.Log.w("VolumeOverlayService", "Error in lifecycle cleanup", e)
+        }
 
-        // Clear ViewModelStore
-        _viewModelStore.clear()
+        // Clear view model store
+        try {
+            _viewModelStore.clear()
+        } catch (e: Exception) {
+            android.util.Log.w("VolumeOverlayService", "Error clearing view model store", e)
+        }
 
         // Remove overlay view
-        if (::overlayView.isInitialized) {
+        if (::overlayView.isInitialized && ::windowManager.isInitialized) {
             try {
                 windowManager.removeView(overlayView)
+                android.util.Log.d("VolumeOverlayService", "Overlay view removed successfully")
             } catch (e: Exception) {
-                e.printStackTrace()
+                android.util.Log.e("VolumeOverlayService", "Error removing overlay view", e)
             }
         }
 
         super.onDestroy()
     }
 
-    /**
-     * Sets up ViewTree owners for the ComposeView to work in Service context
-     */
     private fun ComposeView.setupViewTreeOwners() {
         try {
-            // Set ViewTreeLifecycleOwner
             val lifecycleOwnerClass = Class.forName("androidx.lifecycle.ViewTreeLifecycleOwner")
             val setLifecycleMethod = lifecycleOwnerClass.getMethod("set", android.view.View::class.java, LifecycleOwner::class.java)
             setLifecycleMethod.invoke(null, this, this@VolumeOverlayService)
@@ -247,7 +307,6 @@ class VolumeOverlayService : Service(), LifecycleOwner, ViewModelStoreOwner,
         }
 
         try {
-            // Set ViewTreeViewModelStoreOwner
             val viewModelStoreOwnerClass = Class.forName("androidx.lifecycle.ViewTreeViewModelStoreOwner")
             val setViewModelMethod = viewModelStoreOwnerClass.getMethod("set", android.view.View::class.java, ViewModelStoreOwner::class.java)
             setViewModelMethod.invoke(null, this, this@VolumeOverlayService)
@@ -256,7 +315,6 @@ class VolumeOverlayService : Service(), LifecycleOwner, ViewModelStoreOwner,
         }
 
         try {
-            // Set ViewTreeSavedStateRegistryOwner
             val savedStateRegistryOwnerClass = Class.forName("androidx.savedstate.ViewTreeSavedStateRegistryOwner")
             val setSavedStateMethod = savedStateRegistryOwnerClass.getMethod("set", android.view.View::class.java, SavedStateRegistryOwner::class.java)
             setSavedStateMethod.invoke(null, this, this@VolumeOverlayService)
@@ -266,332 +324,209 @@ class VolumeOverlayService : Service(), LifecycleOwner, ViewModelStoreOwner,
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
-
-    /**
-     * Check if device is currently locked (for potential lock screen optimizations)
-     */
-    private fun isDeviceLocked(): Boolean {
-        val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-        return keyguardManager.isKeyguardLocked
-    }
 }
 
 @Composable
-fun FloatingVolumeWidget(
+fun SimpleVolumeWidget(
     audioManager: AudioManager,
-    onDrag: (Float, Float) -> Unit
+    onOpenMainApp: () -> Unit
 ) {
     var isExpanded by remember { mutableStateOf(false) }
-    var isMuted by remember { mutableStateOf(false) }
-    var currentVolume by remember {
-        mutableStateOf(audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
-    }
+    var currentVolume by remember { mutableIntStateOf(audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)) }
+    var isMuted by remember { mutableStateOf(currentVolume == 0) }
 
-    val maxVolume = remember {
-        audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-    }
+    val maxVolume = remember { audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC) }
 
-    // Optimize volume updates - less frequent polling
+    // Update volume when expanded
     LaunchedEffect(isExpanded) {
-        while (isExpanded) {
-            val volume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-            if (volume != currentVolume) {
-                currentVolume = volume
-                isMuted = volume == 0
+        if (isExpanded) {
+            while (isExpanded) {
+                try {
+                    val volume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                    if (volume != currentVolume) {
+                        currentVolume = volume
+                        isMuted = volume == 0
+                    }
+                    delay(500) // Less frequent updates
+                } catch (e: Exception) {
+                    break
+                }
             }
-            delay(200) // Update every 200ms only when expanded
         }
     }
 
-    Box(
-        modifier = Modifier
-            .wrapContentSize()
-            .pointerInput(Unit) {
-                detectDragGestures { _, dragAmount ->
-                    onDrag(dragAmount.x, dragAmount.y)
+    // Auto-collapse after 8 seconds
+    LaunchedEffect(isExpanded) {
+        if (isExpanded) {
+            delay(8000)
+            isExpanded = false
+        }
+    }
+
+    if (isExpanded) {
+        Card(
+            modifier = Modifier
+                .width(200.dp)
+                .shadow(8.dp, RoundedCornerShape(16.dp))
+                .clickable { onOpenMainApp() },
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+            )
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "${((currentVolume.toFloat() / maxVolume) * 100).toInt()}%",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    IconButton(onClick = { isExpanded = false }) {
+                        Icon(Icons.Default.Close, contentDescription = "Close", modifier = Modifier.size(18.dp))
+                    }
                 }
-            }
-    ) {
-        AnimatedContent(
-            targetState = isExpanded,
-            transitionSpec = {
-                if (targetState) {
-                    (slideInHorizontally(
-                        animationSpec = tween(200, easing = FastOutSlowInEasing)
-                    ) { width -> width } + fadeIn(tween(150))).togetherWith(
-                        slideOutHorizontally(
-                        animationSpec = tween(150, easing = FastOutLinearInEasing)
-                    ) { width -> width } + fadeOut(tween(100)))
-                } else {
-                    (slideInHorizontally(
-                        animationSpec = tween(150, easing = FastOutLinearInEasing)
-                    ) { width -> -width } + fadeIn(tween(100))).togetherWith(
-                        slideOutHorizontally(
-                        animationSpec = tween(200, easing = FastOutSlowInEasing)
-                    ) { width -> -width } + fadeOut(tween(150)))
-                }.using(SizeTransform(clip = false))
-            },
-            label = "expand_animation"
-        ) { expanded ->
-            if (expanded) {
-                ExpandedVolumeControls(
-                    currentVolume = currentVolume,
-                    maxVolume = maxVolume,
-                    isMuted = isMuted,
-                    onMuteToggle = { muted ->
-                        isMuted = muted
-                        if (muted) {
-                            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
-                            currentVolume = 0
-                        } else {
-                            val newVolume = (maxVolume * 0.5f).toInt().coerceAtLeast(1)
-                            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newVolume, 0)
-                            currentVolume = newVolume
-                        }
-                    },
-                    onVolumeDown = {
-                        if (currentVolume > 0) {
-                            // Show system volume UI for multi-channel control
-                            audioManager.adjustStreamVolume(
-                                AudioManager.STREAM_MUSIC,
-                                AudioManager.ADJUST_LOWER,
-                                AudioManager.FLAG_SHOW_UI
-                            )
-                            // Update our state after a brief delay to allow system UI to show
-                            CoroutineScope(Dispatchers.Main).launch {
-                                delay(100)
-                                currentVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-                                if (currentVolume == 0) {
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                LinearProgressIndicator(
+                    progress = { currentVolume.toFloat() / maxVolume },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(2.dp)),
+                    color = if (isMuted) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    FilledTonalButton(
+                        onClick = {
+                            try {
+                                if (isMuted || currentVolume == 0) {
+                                    val newVolume = (maxVolume * 0.5f).toInt().coerceAtLeast(1)
+                                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newVolume, 0)
+                                    currentVolume = newVolume
+                                    isMuted = false
+                                } else {
+                                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+                                    currentVolume = 0
                                     isMuted = true
                                 }
+                            } catch (e: Exception) {
+                                android.util.Log.e("VolumeWidget", "Error toggling mute", e)
                             }
-                        }
-                    },
-                    onVolumeUp = {
-                        // Show system volume UI for multi-channel control
-                        audioManager.adjustStreamVolume(
-                            AudioManager.STREAM_MUSIC,
-                            AudioManager.ADJUST_RAISE,
-                            AudioManager.FLAG_SHOW_UI
+                        },
+                        modifier = Modifier.size(40.dp),
+                        shape = CircleShape,
+                        contentPadding = PaddingValues(0.dp)
+                    ) {
+                        Icon(
+                            if (isMuted || currentVolume == 0) Icons.AutoMirrored.Filled.VolumeOff
+                            else Icons.AutoMirrored.Filled.VolumeMute,
+                            contentDescription = "Mute",
+                            modifier = Modifier.size(18.dp)
                         )
-                        // Update our state after a brief delay to allow system UI to show
-                        CoroutineScope(Dispatchers.Main).launch {
-                            delay(100)
-                            currentVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-                            if (currentVolume > 0) {
-                                isMuted = false
+                    }
+
+                    FilledTonalButton(
+                        onClick = {
+                            try {
+                                audioManager.adjustStreamVolume(
+                                    AudioManager.STREAM_MUSIC,
+                                    AudioManager.ADJUST_LOWER,
+                                    AudioManager.FLAG_SHOW_UI
+                                )
+                                currentVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                                isMuted = currentVolume == 0
+                            } catch (e: Exception) {
+                                android.util.Log.e("VolumeWidget", "Error decreasing volume", e)
                             }
-                        }
-                    },
-                    onClose = { isExpanded = false }
-                )
-            } else {
-                CollapsedVolumeButton(
-                    onClick = { isExpanded = true }
-                )
-            }
-        }
-    }
-}
+                        },
+                        modifier = Modifier.size(40.dp),
+                        shape = CircleShape,
+                        enabled = currentVolume > 0,
+                        contentPadding = PaddingValues(0.dp)
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.VolumeDown,
+                            contentDescription = "Volume Down",
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
 
-@Composable
-private fun ExpandedVolumeControls(
-    currentVolume: Int,
-    maxVolume: Int,
-    isMuted: Boolean,
-    onMuteToggle: (Boolean) -> Unit,
-    onVolumeDown: () -> Unit,
-    onVolumeUp: () -> Unit,
-    onClose: () -> Unit
-) {
-    // Glassmorphism container
-    Box(
-        modifier = Modifier
-            .width(GlassTheme.expandedWidth)
-            .background(
-                color = GlassTheme.glassBackground(),
-                shape = RoundedCornerShape(GlassTheme.cornerRadius)
-            )
-            .border(
-                width = 1.dp,
-                color = GlassTheme.glassBorder(),
-                shape = RoundedCornerShape(GlassTheme.cornerRadius)
-            )
-            .clip(RoundedCornerShape(GlassTheme.cornerRadius))
-    ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            // Compact header
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "${((currentVolume.toFloat() / maxVolume) * 100).toInt()}%",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.9f)
-                )
-
-                IconButton(
-                    onClick = onClose,
-                    modifier = Modifier.size(GlassTheme.closeButtonSize)
-                ) {
-                    Icon(
-                        Icons.Default.Close,
-                        contentDescription = "Close",
-                        modifier = Modifier.size(14.dp),
-                        tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
-                    )
+                    FilledTonalButton(
+                        onClick = {
+                            try {
+                                audioManager.adjustStreamVolume(
+                                    AudioManager.STREAM_MUSIC,
+                                    AudioManager.ADJUST_RAISE,
+                                    AudioManager.FLAG_SHOW_UI
+                                )
+                                currentVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                                isMuted = false
+                            } catch (e: Exception) {
+                                android.util.Log.e("VolumeWidget", "Error increasing volume", e)
+                            }
+                        },
+                        modifier = Modifier.size(40.dp),
+                        shape = CircleShape,
+                        enabled = currentVolume < maxVolume,
+                        contentPadding = PaddingValues(0.dp)
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.VolumeUp,
+                            contentDescription = "Volume Up",
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
-            }
 
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // Compact control buttons
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                GlassVolumeButton(
-                    icon = if (isMuted || currentVolume == 0) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeMute,
-                    contentDescription = if (isMuted) "Unmute" else "Mute",
-                    onClick = { onMuteToggle(!isMuted) },
-                    isActive = isMuted,
-                    color = if (isMuted) GlassTheme.errorGlass() else GlassTheme.secondaryGlass()
-                )
-
-                GlassVolumeButton(
-                    icon = Icons.AutoMirrored.Filled.VolumeDown,
-                    contentDescription = "Volume Down",
-                    onClick = onVolumeDown,
-                    enabled = currentVolume > 0,
-                    color = GlassTheme.secondaryGlass()
-                )
-
-                GlassVolumeButton(
-                    icon = Icons.AutoMirrored.Filled.VolumeUp,
-                    contentDescription = "Volume Up",
-                    onClick = onVolumeUp,
-                    enabled = currentVolume < maxVolume,
-                    color = GlassTheme.secondaryGlass()
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Tap here to open app",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
                 )
             }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // Compact progress indicator
-            LinearProgressIndicator(
-                progress = { currentVolume.toFloat() / maxVolume },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(3.dp)
-                    .clip(RoundedCornerShape(1.5.dp)),
-                color = if (isMuted || currentVolume == 0)
-                    MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
-                else
-                    GlassTheme.primaryGlass(),
-                trackColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f)
+        }
+    } else {
+        Card(
+            modifier = Modifier
+                .size(56.dp)
+                .shadow(6.dp, CircleShape)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = rememberRipple(bounded = true, radius = 28.dp)
+                ) {
+                    isExpanded = true
+                },
+            shape = CircleShape,
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.primary
             )
+        ) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier.fillMaxSize()
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Filled.VolumeUp,
+                    contentDescription = "Volume Control",
+                    modifier = Modifier.size(24.dp),
+                    tint = MaterialTheme.colorScheme.onPrimary
+                )
+            }
         }
     }
-}
-
-@Composable
-private fun CollapsedVolumeButton(
-    onClick: () -> Unit
-) {
-    Box(
-        modifier = Modifier
-            .size(GlassTheme.collapsedSize)
-            .background(
-                color = GlassTheme.primaryGlass(),
-                shape = CircleShape
-            )
-            .border(
-                width = 1.dp,
-                color = GlassTheme.glassBorder(),
-                shape = CircleShape
-            )
-            .clip(CircleShape)
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = rememberRipple(bounded = true, radius = 24.dp)
-            ) { onClick() },
-        contentAlignment = Alignment.Center
-    ) {
-        Icon(
-            Icons.AutoMirrored.Filled.VolumeUp,
-            contentDescription = "Expand Volume Controls",
-            modifier = Modifier.size(22.dp),
-            tint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.9f)
-        )
-    }
-}
-
-@Composable
-fun GlassVolumeButton(
-    icon: ImageVector,
-    contentDescription: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    enabled: Boolean = true,
-    isActive: Boolean = false,
-    color: Color = GlassTheme.secondaryGlass()
-) {
-    // Simplified animation - no scale effect for better performance
-    val buttonColor by animateColorAsState(
-        targetValue = if (isActive) color else color.copy(alpha = 0.6f),
-        animationSpec = tween(150),
-        label = "button_color"
-    )
-
-    Box(
-        modifier = modifier
-            .size(GlassTheme.buttonSize)
-            .background(
-                color = buttonColor.copy(alpha = if (enabled) buttonColor.alpha else 0.3f),
-                shape = CircleShape
-            )
-            .border(
-                width = 0.5.dp,
-                color = GlassTheme.glassBorder().copy(alpha = if (enabled) 0.5f else 0.2f),
-                shape = CircleShape
-            )
-            .clip(CircleShape)
-            .clickable(enabled = enabled) { onClick() },
-        contentAlignment = Alignment.Center
-    ) {
-        Icon(
-            icon,
-            contentDescription = contentDescription,
-            modifier = Modifier.size(GlassTheme.iconSize),
-            tint = MaterialTheme.colorScheme.onSurface.copy(
-                alpha = if (enabled) 0.8f else 0.4f
-            )
-        )
-    }
-}
-
-// Keep the old VolumeControlButton for backward compatibility, but simplified
-@Composable
-fun VolumeControlButton(
-    icon: ImageVector,
-    contentDescription: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    enabled: Boolean = true,
-    isActive: Boolean = false
-) {
-    GlassVolumeButton(
-        icon = icon,
-        contentDescription = contentDescription,
-        onClick = onClick,
-        modifier = modifier,
-        enabled = enabled,
-        isActive = isActive
-    )
 }

@@ -16,3 +16,10 @@ local.properties
 
 /.idea/
 /.idea/
+app/google-services.json
+
+# Release signing & outputs
+keystore.properties
+*.jks
+*.keystore
+/app/release/

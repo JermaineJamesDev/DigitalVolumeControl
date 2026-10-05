@@ -29,8 +29,8 @@ enum class AudioStreamType(
 
 /** Widget control style — vertical sliders or discrete buttons. */
 enum class ControlStyle(val prefValue: String, val displayName: String) {
-    SLIDER("slider", "Vertical Slider"),
-    BUTTONS("Buttons", "Up / Down Buttons");
+    SLIDER("slider", "Sliders"),
+    BUTTONS("Buttons", "Buttons");
 
     companion object {
         fun fromPref(value: String): ControlStyle =

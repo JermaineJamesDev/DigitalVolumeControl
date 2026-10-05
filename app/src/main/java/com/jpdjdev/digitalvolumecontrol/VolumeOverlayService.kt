@@ -19,19 +19,22 @@ import android.view.MotionEvent
 import android.view.WindowManager
 import androidx.annotation.DrawableRes
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.verticalDrag
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -44,12 +47,14 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.FilledTonalIconToggleButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -60,23 +65,29 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.layout.layout
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.setProgress
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -89,6 +100,7 @@ import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.jpdjdev.digitalvolumecontrol.ui.FloatingVolumeTheme
+import com.jpdjdev.digitalvolumecontrol.ui.icon
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -502,95 +514,90 @@ private fun ExpandedPanel(
         onCollapse()
     }
 
-    val panelWidth = when {
-        controlStyle == ControlStyle.BUTTONS -> 200.dp
-        streams.size <= 2 -> 140.dp
-        streams.size <= 3 -> 190.dp
-        else -> 240.dp
+    // Slider columns size the panel to their count; button rows need a fixed
+    // width because their progress bars report a large intrinsic width.
+    val contentWidth = when (controlStyle) {
+        ControlStyle.SLIDER -> Modifier.width(IntrinsicSize.Max)
+        ControlStyle.BUTTONS -> Modifier.width(220.dp)
     }
 
     Surface(
         modifier = Modifier
-            .widthIn(min = 130.dp, max = 260.dp)
-            .width(panelWidth)
-            .graphicsLayer {
-                alpha = opacity
-                shadowElevation = 12f
-                shape = RoundedCornerShape(20.dp)
-                clip = true
-            },
-        shape = RoundedCornerShape(20.dp),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
-        shadowElevation = 8.dp,
-        tonalElevation = 4.dp
+            .widthIn(min = 168.dp)
+            .graphicsLayer { alpha = opacity },
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        border = BorderStroke(
+            width = 1.dp,
+            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+        )
     ) {
         Column(
-            modifier = Modifier
-                .border(
-                    width = 1.dp,
-                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
-                    shape = RoundedCornerShape(20.dp)
-                )
-                .padding(12.dp),
+            modifier = contentWidth.padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             // Header row
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                Icon(
+                    painterResource(R.drawable.ic_volume_up),
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = "Volume",
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f)
                 )
-                IconButton(
-                    onClick = onCollapse,
-                    modifier = Modifier.size(28.dp)
-                ) {
-                    Icon(
-                        Icons.Default.Close,
-                        contentDescription = "Collapse",
-                        modifier = Modifier.size(16.dp),
-                        tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                    )
-                }
+                PanelIconButton(
+                    icon = Icons.Default.Settings,
+                    contentDescription = "Open settings",
+                    onClick = onOpenApp
+                )
+                PanelIconButton(
+                    icon = Icons.Default.Close,
+                    contentDescription = "Close",
+                    onClick = onCollapse
+                )
             }
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            when (controlStyle) {
-                ControlStyle.SLIDER -> SliderControls(
-                    audioManager = audioManager,
-                    streams = streams,
-                    onInteraction = { lastInteraction = System.currentTimeMillis() }
-                )
+            // The header has asymmetric padding to align its icon buttons with
+            // the edge; re-balance it so the controls sit centred.
+            Box(modifier = Modifier.padding(end = 8.dp)) {
+                when (controlStyle) {
+                    ControlStyle.SLIDER -> SliderControls(
+                        audioManager = audioManager,
+                        streams = streams,
+                        onInteraction = { lastInteraction = System.currentTimeMillis() }
+                    )
 
-                ControlStyle.BUTTONS -> ButtonControls(
-                    audioManager = audioManager,
-                    streams = streams,
-                    onInteraction = { lastInteraction = System.currentTimeMillis() }
-                )
+                    ControlStyle.BUTTONS -> ButtonControls(
+                        audioManager = audioManager,
+                        streams = streams,
+                        onInteraction = { lastInteraction = System.currentTimeMillis() }
+                    )
+                }
             }
-
-            Spacer(modifier = Modifier.height(6.dp))
-
-            // "Open app" link
-            Text(
-                text = "Open app",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null
-                    ) { onOpenApp() }
-                    .padding(horizontal = 12.dp, vertical = 6.dp)
-            )
         }
+    }
+}
+
+@Composable
+private fun PanelIconButton(icon: ImageVector, contentDescription: String, onClick: () -> Unit) {
+    IconButton(onClick = onClick, modifier = Modifier.size(36.dp)) {
+        Icon(
+            icon,
+            contentDescription = contentDescription,
+            modifier = Modifier.size(18.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 
@@ -670,6 +677,34 @@ private fun rememberStreamVolumeState(
 private fun muteIcon(isMuted: Boolean): Int =
     if (isMuted) R.drawable.ic_volume_off else R.drawable.ic_volume_up
 
+@Composable
+private fun MuteToggle(
+    state: StreamVolumeState,
+    stream: AudioStreamType,
+    onInteraction: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    FilledTonalIconToggleButton(
+        checked = state.isMuted,
+        onCheckedChange = {
+            onInteraction()
+            state.toggleMute()
+        },
+        modifier = modifier,
+        colors = IconButtonDefaults.filledTonalIconToggleButtonColors(
+            checkedContainerColor = MaterialTheme.colorScheme.errorContainer,
+            checkedContentColor = MaterialTheme.colorScheme.onErrorContainer
+        )
+    ) {
+        Icon(
+            painterResource(muteIcon(state.isMuted)),
+            // Toggle semantics announce on/off, so the label names the action.
+            contentDescription = "Mute ${stream.label}",
+            modifier = Modifier.size(18.dp)
+        )
+    }
+}
+
 /* ── Slider-mode controls ──────────────────────────────────────────── */
 
 @Composable
@@ -678,10 +713,7 @@ private fun SliderControls(
     streams: List<AudioStreamType>,
     onInteraction: () -> Unit
 ) {
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.Bottom
-    ) {
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         streams.forEach { stream ->
             StreamSliderColumn(
                 audioManager = audioManager,
@@ -702,75 +734,46 @@ private fun StreamSliderColumn(
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier.width(44.dp)
+        modifier = Modifier.width(48.dp)
     ) {
-        // Percentage
         Text(
             text = "${state.percent}",
-            style = MaterialTheme.typography.labelSmall,
+            style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.Bold,
-            fontSize = 10.sp,
             color = MaterialTheme.colorScheme.onSurface
         )
 
-        Spacer(modifier = Modifier.height(4.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
-        // Vertical slider
-        VerticalSlider(
-            value = state.volume.toFloat(),
-            onValueChange = { newVal ->
-                val v = newVal.roundToInt()
+        PillSlider(
+            value = state.volume,
+            maxValue = state.maxVolume,
+            onValueChange = { v ->
                 if (v != state.volume) {
                     state.set(v)
                     onInteraction()
                 }
             },
-            valueRange = 0f..state.maxVolume.toFloat(),
-            steps = (state.maxVolume - 1).coerceAtLeast(0),
-            modifier = Modifier
-                .height(110.dp)
-                .width(28.dp),
-            activeColor = if (state.isMuted)
-                MaterialTheme.colorScheme.error
-            else
-                MaterialTheme.colorScheme.primary,
-            inactiveColor = MaterialTheme.colorScheme.outlineVariant
+            label = "${stream.label} volume",
+            icon = stream.icon,
+            modifier = Modifier.size(width = 44.dp, height = 140.dp)
         )
 
-        Spacer(modifier = Modifier.height(4.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
-        // Mute toggle
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier
-                .size(30.dp)
-                .clip(CircleShape)
-                .background(
-                    if (state.isMuted) MaterialTheme.colorScheme.error.copy(alpha = 0.15f)
-                    else MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
-                )
-                .clickable {
-                    onInteraction()
-                    state.toggleMute()
-                }
-        ) {
-            Icon(
-                painterResource(muteIcon(state.isMuted)),
-                contentDescription = if (state.isMuted) "Unmute ${stream.label}"
-                else "Mute ${stream.label}",
-                modifier = Modifier.size(16.dp),
-                tint = if (state.isMuted) MaterialTheme.colorScheme.error
-                else MaterialTheme.colorScheme.onSurface
-            )
-        }
+        MuteToggle(
+            state = state,
+            stream = stream,
+            onInteraction = onInteraction,
+            modifier = Modifier.size(36.dp)
+        )
 
         Spacer(modifier = Modifier.height(2.dp))
 
         Text(
             text = stream.shortLabel,
             style = MaterialTheme.typography.labelSmall,
-            fontSize = 9.sp,
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center
         )
     }
@@ -784,7 +787,7 @@ private fun ButtonControls(
     streams: List<AudioStreamType>,
     onInteraction: () -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         streams.forEach { stream ->
             StreamButtonRow(
                 audioManager = audioManager,
@@ -802,139 +805,175 @@ private fun StreamButtonRow(
     onInteraction: () -> Unit
 ) {
     val state = rememberStreamVolumeState(audioManager, stream)
+    val levelColor = if (state.isMuted) MaterialTheme.colorScheme.error
+    else MaterialTheme.colorScheme.primary
 
     Column {
         // Stream label + percentage
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
+            verticalAlignment = Alignment.CenterVertically
         ) {
+            Icon(
+                stream.icon,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.width(6.dp))
             Text(
-                text = stream.shortLabel,
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.Medium,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
+                text = stream.label,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f)
             )
             Text(
                 text = "${state.percent}%",
-                style = MaterialTheme.typography.labelSmall,
+                style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.Bold,
-                color = if (state.isMuted) MaterialTheme.colorScheme.error
-                else MaterialTheme.colorScheme.primary
+                color = levelColor
             )
         }
 
-        Spacer(modifier = Modifier.height(4.dp))
+        Spacer(modifier = Modifier.height(6.dp))
+
+        LinearProgressIndicator(
+            progress = { state.volume.toFloat() / state.maxVolume },
+            modifier = Modifier.fillMaxWidth(),
+            color = levelColor,
+            trackColor = MaterialTheme.colorScheme.surfaceContainerHighest
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
 
         // Control row: [Mute] [−] [+]
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // Mute toggle
-            FilledTonalButton(
-                onClick = {
-                    onInteraction()
-                    state.toggleMute()
-                },
-                modifier = Modifier.size(34.dp),
-                shape = CircleShape,
-                contentPadding = PaddingValues(0.dp)
-            ) {
-                Icon(
-                    painterResource(muteIcon(state.isMuted)),
-                    contentDescription = if (state.isMuted) "Unmute ${stream.label}"
-                    else "Mute ${stream.label}",
-                    modifier = Modifier.size(16.dp)
-                )
-            }
+            val buttonModifier = Modifier
+                .weight(1f)
+                .height(36.dp)
 
-            // Volume down
-            FilledTonalButton(
+            MuteToggle(
+                state = state,
+                stream = stream,
+                onInteraction = onInteraction,
+                modifier = buttonModifier
+            )
+
+            FilledTonalIconButton(
                 onClick = {
                     onInteraction()
                     state.adjust(AudioManager.ADJUST_LOWER)
                 },
-                modifier = Modifier.size(34.dp),
-                shape = CircleShape,
-                enabled = state.volume > 0,
-                contentPadding = PaddingValues(0.dp)
+                modifier = buttonModifier,
+                enabled = state.volume > 0
             ) {
                 Icon(
                     painterResource(R.drawable.ic_remove),
                     contentDescription = "${stream.label} volume down",
-                    modifier = Modifier.size(16.dp)
+                    modifier = Modifier.size(18.dp)
                 )
             }
 
-            // Volume up
-            FilledTonalButton(
+            FilledTonalIconButton(
                 onClick = {
                     onInteraction()
                     state.adjust(AudioManager.ADJUST_RAISE)
                 },
-                modifier = Modifier.size(34.dp),
-                shape = CircleShape,
-                enabled = state.volume < state.maxVolume,
-                contentPadding = PaddingValues(0.dp)
+                modifier = buttonModifier,
+                enabled = state.volume < state.maxVolume
             ) {
                 Icon(
                     painterResource(R.drawable.ic_add),
                     contentDescription = "${stream.label} volume up",
-                    modifier = Modifier.size(16.dp)
+                    modifier = Modifier.size(18.dp)
                 )
             }
         }
     }
 }
 
-/* ── Vertical Slider helper ────────────────────────────────────────── */
+/* ── Pill slider ───────────────────────────────────────────────────── */
 
 /**
- * Rotates a standard horizontal [Slider] by 270° and swaps its layout
- * dimensions so it occupies correct vertical space. Standard Compose pattern.
+ * Thick vertical slider in the style of the Android 12+ system volume panel.
+ * The level jumps to the touch point on press and follows the finger while
+ * dragging. Slider semantics let TalkBack read and adjust it like a standard slider.
  */
 @Composable
-private fun VerticalSlider(
-    value: Float,
-    onValueChange: (Float) -> Unit,
-    modifier: Modifier = Modifier,
-    valueRange: ClosedFloatingPointRange<Float> = 0f..1f,
-    steps: Int = 0,
-    activeColor: Color = MaterialTheme.colorScheme.primary,
-    inactiveColor: Color = MaterialTheme.colorScheme.outlineVariant
+private fun PillSlider(
+    value: Int,
+    maxValue: Int,
+    onValueChange: (Int) -> Unit,
+    label: String,
+    icon: ImageVector,
+    modifier: Modifier = Modifier
 ) {
-    Slider(
-        value = value,
-        onValueChange = onValueChange,
-        valueRange = valueRange,
-        steps = steps,
-        colors = SliderDefaults.colors(
-            thumbColor = activeColor,
-            activeTrackColor = activeColor,
-            inactiveTrackColor = inactiveColor
-        ),
+    // The gesture coroutine outlives recompositions, so read the latest
+    // callback and range through updated state rather than capturing them.
+    val currentOnValueChange by rememberUpdatedState(onValueChange)
+    val currentMax by rememberUpdatedState(maxValue)
+
+    val fraction by animateFloatAsState(
+        targetValue = value.toFloat() / maxValue,
+        animationSpec = tween(100),
+        label = "pillFill"
+    )
+    val trackColor = MaterialTheme.colorScheme.surfaceContainerHighest
+    val fillColor = MaterialTheme.colorScheme.primary
+    // Icon sits in the bottom ~25% of the pill; switch its tint once the fill covers it.
+    val iconTint = if (fraction > 0.22f) MaterialTheme.colorScheme.onPrimary
+    else MaterialTheme.colorScheme.onSurfaceVariant
+
+    Box(
+        contentAlignment = Alignment.BottomCenter,
         modifier = modifier
-            .graphicsLayer {
-                rotationZ = 270f
-                transformOrigin = TransformOrigin(0.5f, 0.5f)
-            }
-            .layout { measurable, constraints ->
-                val placeable = measurable.measure(
-                    Constraints(
-                        minWidth = constraints.minHeight,
-                        maxWidth = constraints.maxHeight,
-                        minHeight = constraints.minWidth,
-                        maxHeight = constraints.maxWidth
-                    )
+            .clip(RoundedCornerShape(16.dp))
+            .background(trackColor)
+            .drawBehind {
+                val fillHeight = size.height * fraction
+                drawRect(
+                    color = fillColor,
+                    topLeft = Offset(0f, size.height - fillHeight),
+                    size = Size(size.width, fillHeight)
                 )
-                layout(placeable.height, placeable.width) {
-                    placeable.place(
-                        x = -(placeable.width - placeable.height) / 2,
-                        y = -(placeable.height - placeable.width) / 2
-                    )
+            }
+            .pointerInput(Unit) {
+                fun valueAt(y: Float): Int =
+                    ((1f - y / size.height) * currentMax).roundToInt().coerceIn(0, currentMax)
+
+                awaitEachGesture {
+                    val down = awaitFirstDown()
+                    down.consume()
+                    currentOnValueChange(valueAt(down.position.y))
+                    verticalDrag(down.id) { change ->
+                        change.consume()
+                        currentOnValueChange(valueAt(change.position.y))
+                    }
                 }
             }
-    )
+            .semantics {
+                contentDescription = label
+                progressBarRangeInfo = ProgressBarRangeInfo(
+                    current = value.toFloat(),
+                    range = 0f..maxValue.toFloat(),
+                    steps = (maxValue - 1).coerceAtLeast(0)
+                )
+                setProgress { target ->
+                    currentOnValueChange(target.roundToInt().coerceIn(0, currentMax))
+                    true
+                }
+            }
+    ) {
+        Icon(
+            icon,
+            contentDescription = null,
+            tint = iconTint,
+            modifier = Modifier
+                .padding(bottom = 12.dp)
+                .size(20.dp)
+        )
+    }
 }

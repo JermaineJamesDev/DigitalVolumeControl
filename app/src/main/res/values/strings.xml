@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">Digital Volume Control</string>
+    <string name="accessibility_service_description">Shows a floating volume bubble above other apps so you can change volume without the hardware buttons. It does not read your screen, record what you type, or perform actions for you.</string>
 </resources>

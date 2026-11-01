@@ -15,11 +15,11 @@ enum class AudioStreamType(
     val shortLabel: String,
     val prefKey: String
 ) {
-    MEDIA(AudioManager.STREAM_MUSIC, "Media", "Med", "stream_media"),
+    MEDIA(AudioManager.STREAM_MUSIC, "Media", "Media", "stream_media"),
     RING(AudioManager.STREAM_RING, "Ring", "Ring", "stream_ring"),
-    NOTIFICATION(AudioManager.STREAM_NOTIFICATION, "Notification", "Notif", "stream_notification"),
-    ALARM(AudioManager.STREAM_ALARM, "Alarm", "Alrm", "stream_alarm"),
-    SYSTEM(AudioManager.STREAM_SYSTEM, "System", "Sys", "stream_system");
+    NOTIFICATION(AudioManager.STREAM_NOTIFICATION, "Notification", "Notify", "stream_notification"),
+    ALARM(AudioManager.STREAM_ALARM, "Alarm", "Alarm", "stream_alarm"),
+    SYSTEM(AudioManager.STREAM_SYSTEM, "System", "System", "stream_system");
 
     companion object {
         /** Default streams enabled on first launch. */
@@ -101,6 +101,44 @@ class WidgetPreferences(private val prefs: SharedPreferences) {
             putFloat(KEY_OPACITY, value.coerceIn(MIN_OPACITY, MAX_OPACITY))
         }
 
+    /* ── Bubble visibility ─────────────────────────────────────────── */
+
+    /**
+     * Whether the bubble is shown while the accessibility service is enabled.
+     * Persisted so a hidden bubble stays hidden when the service restarts.
+     */
+    var widgetVisible: Boolean
+        get() = prefs.getBoolean(KEY_WIDGET_VISIBLE, true)
+        set(value) = prefs.edit { putBoolean(KEY_WIDGET_VISIBLE, value) }
+
+    /* ── Bubble position ───────────────────────────────────────────── */
+
+    /** Which screen edge the bubble is docked to. */
+    val bubbleDockedRight: Boolean
+        get() = prefs.getBoolean(KEY_BUBBLE_DOCKED_RIGHT, false)
+
+    /**
+     * Vertical bubble position as a fraction (0 = top, 1 = bottom) of the space
+     * the bubble can move in, so it lands in the same place after rotation.
+     */
+    val bubbleYFraction: Float
+        get() = prefs.getFloat(KEY_BUBBLE_Y_FRACTION, DEFAULT_BUBBLE_Y_FRACTION).coerceIn(0f, 1f)
+
+    fun saveBubblePosition(dockedRight: Boolean, yFraction: Float) = prefs.edit {
+        putBoolean(KEY_BUBBLE_DOCKED_RIGHT, dockedRight)
+        putFloat(KEY_BUBBLE_Y_FRACTION, yFraction.coerceIn(0f, 1f))
+    }
+
+    /**
+     * [SharedPreferences] keeps only a weak reference to [listener], so the
+     * caller must hold a strong reference until it unregisters.
+     */
+    fun registerChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener) =
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+
+    fun unregisterChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener) =
+        prefs.unregisterOnSharedPreferenceChangeListener(listener)
+
     /* ── Constants ─────────────────────────────────────────────────── */
 
     companion object {
@@ -108,9 +146,17 @@ class WidgetPreferences(private val prefs: SharedPreferences) {
         private const val KEY_CONTROL_STYLE = "control_style"
         private const val KEY_ENABLED_STREAMS_PREFIX = "enabled_"
         private const val KEY_OPACITY = "widget_opacity"
+        const val KEY_WIDGET_VISIBLE = "widget_visible"
+        private const val KEY_BUBBLE_DOCKED_RIGHT = "bubble_docked_right"
+        private const val KEY_BUBBLE_Y_FRACTION = "bubble_y_fraction"
 
         const val DEFAULT_OPACITY = 0.85f
         const val MIN_OPACITY = 0.25f
         const val MAX_OPACITY = 1.0f
+        const val DEFAULT_BUBBLE_Y_FRACTION = 0.2f
+
+        /** Keys the overlay writes itself on every drag; listeners can skip them. */
+        fun isPositionKey(key: String?): Boolean =
+            key == KEY_BUBBLE_DOCKED_RIGHT || key == KEY_BUBBLE_Y_FRACTION
     }
 }

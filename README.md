@@ -19,8 +19,10 @@ and for anyone who prefers an on-screen control.
   volume panel, or compact up/down buttons with a level bar.
 - **Per-stream control** of Media, Ring, Notification, Alarm and System volume,
   each with its own mute toggle. Pick which streams appear.
-- **Adjustable opacity** so the widget stays out of the way.
-- **Auto-collapse** after a few seconds without use.
+- **Adjustable bubble opacity** so the bubble stays out of the way. The panel
+  always opens fully visible.
+- **Closes when you are done**: tap outside the panel, or leave it for a few
+  seconds. Settings changes apply to the widget immediately.
 - **Material You**: follows your wallpaper colours on Android 12+ and supports
   light and dark themes.
 - **Accessible**: the bubble, sliders and buttons work with TalkBack.
@@ -35,13 +37,49 @@ browser or file manager.
 
 Requires **Android 11 (API 30)** or newer.
 
+## Setup
+
+The bubble runs as an Android accessibility service. This keeps it on screen
+for as long as the service is enabled, with no ongoing notification.
+
+1. On Xiaomi, Redmi and POCO phones, turn on **Autostart** for the app first
+   (the app has a shortcut). Without it the phone may refuse to start the
+   service, and the switch turns on and then fails.
+2. Open the app and tap **Open accessibility settings**, then find
+   **Digital Volume Control** (it may be under *Downloaded apps* or
+   *Installed apps*).
+3. Turn the service on.
+4. On Android 13 and newer, apps installed from an APK are blocked at this
+   step. Tap the switch once so Android shows the "Restricted setting"
+   message, then open the app's **App info** page, tap the three-dot menu,
+   choose **Allow restricted settings**, and turn the service on again. The
+   menu item only appears after that first refused attempt.
+
+Use the switch in the app to hide or show the bubble. To turn the service off
+completely, switch it off in Accessibility settings.
+
+### Keeping it running on Xiaomi and similar phones
+
+Some phones, including Xiaomi, Redmi and POCO, close background apps to save
+battery and can switch the service off with them. On the app's **App info**
+page, turn on **Autostart** and set **Battery saver** to **No restrictions**.
+On Xiaomi devices the app has a shortcut straight to the Autostart list. Also
+lock the app in Recent apps so clearing recents does not close it.
+
+If Accessibility settings shows an error or "Not working" for the service,
+Android lost it in the background. The app detects this, shows the reason
+Android recorded for the last stop, and asks you to turn the service off and
+on again.
+
 ## Permissions
 
 | Permission | Why it is needed |
 | --- | --- |
-| Display over other apps (`SYSTEM_ALERT_WINDOW`) | Draws the floating bubble and volume panel above other apps. You grant this from the app's first screen. |
-| Foreground service (`FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE`) | Keeps the widget alive while you use other apps. |
-| Notifications (`POST_NOTIFICATIONS`, Android 13+) | Shows the ongoing "Volume Control Active" notification, which has a Stop action. |
+| Accessibility service (`BIND_ACCESSIBILITY_SERVICE`) | Lets the app draw the floating bubble and volume panel above other apps. You enable it in Accessibility settings. |
+
+The accessibility service requests no accessibility events and cannot read
+window content. It only draws the widget; it does not see what is on screen,
+record what you type, or perform actions for you.
 
 The app does not request internet, storage, location or any other access.
 
@@ -146,8 +184,8 @@ if it is signed with the same key as the installed version.
 
 ```
 app/src/main/java/com/jpdjdev/digitalvolumecontrol/
-├── MainActivity.kt          Settings screen (permission, on/off, appearance, streams)
-├── VolumeOverlayService.kt  Foreground service hosting the floating widget
+├── MainActivity.kt          Settings screen (setup, show/hide, appearance, streams)
+├── VolumeOverlayService.kt  Accessibility service hosting the floating widget
 ├── WidgetPreferences.kt     SharedPreferences wrapper and setting enums
 └── ui/
     ├── Theme.kt             Material 3 theme with dynamic colour
@@ -155,7 +193,7 @@ app/src/main/java/com/jpdjdev/digitalvolumecontrol/
 ```
 
 The UI is written entirely in Jetpack Compose, including the overlay, which is
-a `ComposeView` added through `WindowManager` from the foreground service.
+a `ComposeView` added through `WindowManager` as an accessibility overlay.
 
 ## Contributing
 

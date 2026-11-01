@@ -1,17 +1,19 @@
 package com.jpdjdev.digitalvolumecontrol
 
-import android.Manifest
+import android.app.ActivityManager
+import android.app.ApplicationExitInfo
 import android.content.ActivityNotFoundException
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.text.format.DateUtils
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -37,6 +39,7 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -54,6 +57,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -74,31 +78,24 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
+import androidx.core.os.bundleOf
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.jpdjdev.digitalvolumecontrol.ui.FloatingVolumeTheme
 import com.jpdjdev.digitalvolumecontrol.ui.icon
+import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
 private const val REPO_URL = "https://github.com/JermaineJamesDev/DigitalVolumeControl"
 
-class MainActivity : ComponentActivity() {
+/** How long the service may take to connect before it is reported as stopped. */
+private const val SERVICE_CONNECT_GRACE_MS = 3_000L
 
-    private val notificationPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { /* Result handled via recomposition polling */ }
+class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-
-        // Request notification permission on API 33+.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
 
         setContent {
             FloatingVolumeTheme {
@@ -118,15 +115,31 @@ class MainActivity : ComponentActivity() {
 fun MainScreen() {
     val context = LocalContext.current
     val prefs = remember { WidgetPreferences(context) }
-    var hasOverlayPermission by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
     val isServiceRunning by VolumeOverlayService.isRunning.collectAsStateWithLifecycle()
-    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    var isWidgetVisible by remember { mutableStateOf(prefs.widgetVisible) }
 
-    // Re-check when returning from the system overlay-permission screen.
+    // Re-read on resume: the user toggles the service in system settings.
+    // Seeded synchronously so the "turn on" card does not flash on launch.
+    var isServiceEnabled by remember {
+        mutableStateOf(VolumeOverlayService.isEnabledInSettings(context))
+    }
     LifecycleResumeEffect(Unit) {
-        hasOverlayPermission = Settings.canDrawOverlays(context)
+        isServiceEnabled = VolumeOverlayService.isEnabledInSettings(context)
         onPauseOrDispose { }
     }
+
+    // Right after the user switches the service on (or after the app process
+    // restarts) the system takes a moment to connect it. Only report it as
+    // stopped if it is still not running after a grace period.
+    var connectTimedOut by remember { mutableStateOf(false) }
+    LaunchedEffect(isServiceEnabled, isServiceRunning) {
+        connectTimedOut = false
+        if (isServiceEnabled && !isServiceRunning) {
+            delay(SERVICE_CONNECT_GRACE_MS)
+            connectTimedOut = true
+        }
+    }
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
     Scaffold(
         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
@@ -152,18 +165,14 @@ fun MainScreen() {
                 .padding(bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            if (hasOverlayPermission) {
+            if (isServiceRunning) {
                 ServiceStatusCard(
-                    isServiceRunning = isServiceRunning,
-                    onToggle = { enable ->
-                        val intent = Intent(context, VolumeOverlayService::class.java)
-                        if (enable) {
-                            try {
-                                context.startForegroundService(intent)
-                            } catch (_: Exception) { }
-                        } else {
-                            context.stopService(intent)
-                        }
+                    isWidgetVisible = isWidgetVisible,
+                    onToggle = { visible ->
+                        // The service observes this preference and adds or
+                        // removes the bubble immediately.
+                        isWidgetVisible = visible
+                        prefs.widgetVisible = visible
                     }
                 )
 
@@ -172,18 +181,27 @@ fun MainScreen() {
 
                 SectionHeader("Audio streams")
                 StreamsCard(prefs)
+            } else if (isServiceEnabled && !connectTimedOut) {
+                ServiceStartingCard()
+            } else if (isServiceEnabled) {
+                ServiceStoppedCard(
+                    onOpenAccessibilitySettings = { openAccessibilitySettings(context) },
+                    onOpenAppInfo = { openAppInfo(context) },
+                    onOpenAutostart = { openXiaomiAutostart(context) }
+                )
             } else {
-                PermissionCard(
-                    onRequestPermission = {
-                        context.startActivity(
-                            Intent(
-                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                "package:${context.packageName}".toUri()
-                            )
-                        )
-                    }
+                EnableServiceCard(
+                    onOpenAccessibilitySettings = { openAccessibilitySettings(context) },
+                    onOpenAppInfo = { openAppInfo(context) },
+                    onOpenAutostart = { openXiaomiAutostart(context) }
                 )
             }
+
+            SectionHeader("Keep it running")
+            KeepRunningCard(
+                onOpenAppInfo = { openAppInfo(context) },
+                onOpenAutostart = { openXiaomiAutostart(context) }
+            )
 
             SectionHeader("How to use")
             InstructionsCard()
@@ -231,10 +249,173 @@ private fun SupportingText(text: String, modifier: Modifier = Modifier) {
     )
 }
 
-/* ── Permission Card ───────────────────────────────────────────────── */
+/**
+ * Opens a system settings screen and returns whether it opened. Some OEM
+ * builds omit a few screens or do not export them.
+ */
+private fun openSettings(context: Context, intent: Intent): Boolean =
+    try {
+        context.startActivity(intent)
+        true
+    } catch (_: ActivityNotFoundException) {
+        false
+    } catch (_: SecurityException) {
+        false
+    }
+
+/**
+ * Opens Accessibility settings. The extras ask the Settings app to scroll to
+ * and highlight this service; they are not public API, so builds that do not
+ * understand them (e.g. some MIUI / HyperOS versions) just ignore them. The
+ * direct per-service page needs a system-only permission.
+ */
+private fun openAccessibilitySettings(context: Context) {
+    val service = ComponentName(context, VolumeOverlayService::class.java).flattenToString()
+    val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+        .putExtra(":settings:fragment_args_key", service)
+        .putExtra(":settings:show_fragment_args", bundleOf(":settings:fragment_args_key" to service))
+    openSettings(context, intent)
+}
+
+private fun openAppInfo(context: Context) {
+    openSettings(
+        context,
+        Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            "package:${context.packageName}".toUri()
+        )
+    )
+}
+
+/** Redmi and POCO devices also report Xiaomi as the manufacturer. */
+private val isXiaomi: Boolean = Build.MANUFACTURER.equals("Xiaomi", ignoreCase = true)
+
+/**
+ * MIUI / HyperOS Security app's Autostart list. Not a public API, so it can
+ * move between versions; falls back to App info, which also links to it.
+ */
+private fun openXiaomiAutostart(context: Context) {
+    val intent = Intent().setComponent(
+        ComponentName(
+            "com.miui.securitycenter",
+            "com.miui.permcenter.autostart.AutoStartManagementActivity"
+        )
+    )
+    if (!openSettings(context, intent)) openAppInfo(context)
+}
+
+/**
+ * Describes why the app's process last ended, from the records Android keeps
+ * (API 30+). Returns null if there is no record.
+ */
+private fun lastStopReason(context: Context): String? {
+    val am = context.getSystemService(ActivityManager::class.java) ?: return null
+    val info = am.getHistoricalProcessExitReasons(null, 0, 1).firstOrNull() ?: return null
+    val reason = when (info.reason) {
+        ApplicationExitInfo.REASON_CRASH,
+        ApplicationExitInfo.REASON_CRASH_NATIVE -> "The app crashed"
+        ApplicationExitInfo.REASON_ANR -> "The app stopped responding"
+        ApplicationExitInfo.REASON_LOW_MEMORY -> "Android closed it to free up memory"
+        ApplicationExitInfo.REASON_USER_REQUESTED -> "It was force stopped or cleared from recent apps"
+        ApplicationExitInfo.REASON_SIGNALED,
+        ApplicationExitInfo.REASON_OTHER,
+        ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE ->
+            "The system or a battery saver closed it"
+        else -> "It stopped for another reason"
+    }
+    val ago = DateUtils.getRelativeTimeSpanString(
+        info.timestamp,
+        System.currentTimeMillis(),
+        DateUtils.MINUTE_IN_MILLIS
+    )
+    // The raw description (e.g. an OEM kill reason) helps with bug reports.
+    val detail = info.description?.takeIf { it.isNotBlank() }?.let { " ($it)" }.orEmpty()
+    return "$reason, $ago.$detail"
+}
+
+/* ── Enable Service Card ───────────────────────────────────────────── */
 
 @Composable
-private fun PermissionCard(onRequestPermission: () -> Unit) {
+private fun EnableServiceCard(
+    onOpenAccessibilitySettings: () -> Unit,
+    onOpenAppInfo: () -> Unit,
+    onOpenAutostart: () -> Unit
+) {
+    WarningCard(title = "Turn on the service") {
+        Text(
+            text = "The bubble runs as an accessibility service, so it stays on " +
+                    "screen without any notifications. Turn on Digital Volume " +
+                    "Control in the next screen, then come back here.",
+            style = MaterialTheme.typography.bodyMedium
+        )
+        if (isXiaomi) XiaomiAutostartStep(onOpenAutostart)
+        Spacer(modifier = Modifier.height(16.dp))
+        Button(
+            onClick = onOpenAccessibilitySettings,
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Open accessibility settings") }
+        RestrictedSettingsHelp(onOpenAppInfo)
+    }
+}
+
+/* ── Service Starting Card ─────────────────────────────────────────── */
+
+@Composable
+private fun ServiceStartingCard() {
+    SettingsCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 3.dp)
+            Spacer(modifier = Modifier.width(16.dp))
+            Text(text = "Starting the service…", style = MaterialTheme.typography.titleMedium)
+        }
+    }
+}
+
+/* ── Service Stopped Card ──────────────────────────────────────────── */
+
+/**
+ * Shown when the service is switched on in settings but not connected. The
+ * system shows it as "not working" (or an error on MIUI) after the process
+ * dies, and does not always restart it, so the user has to toggle it.
+ */
+@Composable
+private fun ServiceStoppedCard(
+    onOpenAccessibilitySettings: () -> Unit,
+    onOpenAppInfo: () -> Unit,
+    onOpenAutostart: () -> Unit
+) {
+    val context = LocalContext.current
+    val stopReason = remember { lastStopReason(context) }
+
+    WarningCard(title = "The service has stopped") {
+        Text(
+            text = "It is switched on in Accessibility settings, but Android is not " +
+                    "running it, so the bubble is gone. Open Accessibility settings, " +
+                    "turn Digital Volume Control off, then on again. To stop it " +
+                    "happening again, follow the steps under Keep it running below.",
+            style = MaterialTheme.typography.bodyMedium
+        )
+        if (stopReason != null) {
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = "Last stop: $stopReason",
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+        if (isXiaomi) XiaomiAutostartStep(onOpenAutostart)
+        Spacer(modifier = Modifier.height(16.dp))
+        Button(
+            onClick = onOpenAccessibilitySettings,
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Open accessibility settings") }
+        RestrictedSettingsHelp(onOpenAppInfo)
+    }
+}
+
+/* ── Setup help shared by the warning cards ────────────────────────── */
+
+@Composable
+private fun WarningCard(title: String, content: @Composable ColumnScope.() -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.extraLarge,
@@ -251,46 +432,77 @@ private fun PermissionCard(onRequestPermission: () -> Unit) {
                     modifier = Modifier.size(28.dp)
                 )
                 Spacer(modifier = Modifier.width(12.dp))
-                Text(
-                    text = "Permission needed",
-                    style = MaterialTheme.typography.titleLarge
-                )
+                Text(text = title, style = MaterialTheme.typography.titleLarge)
             }
             Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = "To float above other apps, the widget needs the " +
-                        "\"Display over other apps\" permission. Turn it on in the " +
-                        "next screen, then come back here.",
-                style = MaterialTheme.typography.bodyMedium
-            )
-            Spacer(modifier = Modifier.height(16.dp))
-            Button(
-                onClick = onRequestPermission,
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("Grant permission") }
+            content()
         }
     }
+}
+
+/**
+ * With Autostart off, MIUI / HyperOS can refuse to start the app's process
+ * for the service, so the switch turns on and then fails straight away.
+ */
+@Composable
+private fun XiaomiAutostartStep(onOpenAutostart: () -> Unit) {
+    Spacer(modifier = Modifier.height(12.dp))
+    Text(
+        text = "On Xiaomi, Redmi and POCO phones, turn on Autostart for this app " +
+                "first. Without it the phone may refuse to start the service, and " +
+                "it shows an error or switches itself off.",
+        style = MaterialTheme.typography.bodyMedium
+    )
+    Spacer(modifier = Modifier.height(12.dp))
+    OutlinedButton(
+        onClick = onOpenAutostart,
+        modifier = Modifier.fillMaxWidth()
+    ) { Text("Open Autostart settings") }
+}
+
+/**
+ * Android 13+ blocks accessibility services of apps installed from an APK
+ * until the user allows restricted settings. The App info menu item only
+ * appears after the user has tried the switch once and been refused.
+ */
+@Composable
+private fun RestrictedSettingsHelp(onOpenAppInfo: () -> Unit) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    Spacer(modifier = Modifier.height(16.dp))
+    Text(
+        text = "Switch greyed out, or a \"Restricted setting\" message? Android " +
+                "does this for apps installed from an APK. Tap the switch once so " +
+                "that message appears, then open App info, tap the three-dot menu " +
+                "at the top, choose \"Allow restricted settings\", and turn the " +
+                "service on again.",
+        style = MaterialTheme.typography.bodyMedium
+    )
+    Spacer(modifier = Modifier.height(12.dp))
+    OutlinedButton(
+        onClick = onOpenAppInfo,
+        modifier = Modifier.fillMaxWidth()
+    ) { Text("Open app info") }
 }
 
 /* ── Service Status Card ───────────────────────────────────────────── */
 
 @Composable
-private fun ServiceStatusCard(isServiceRunning: Boolean, onToggle: (Boolean) -> Unit) {
+private fun ServiceStatusCard(isWidgetVisible: Boolean, onToggle: (Boolean) -> Unit) {
     val colors = MaterialTheme.colorScheme
     val containerColor by animateColorAsState(
-        if (isServiceRunning) colors.primaryContainer else colors.surfaceContainerHigh,
+        if (isWidgetVisible) colors.primaryContainer else colors.surfaceContainerHigh,
         label = "statusContainer"
     )
     val contentColor by animateColorAsState(
-        if (isServiceRunning) colors.onPrimaryContainer else colors.onSurface,
+        if (isWidgetVisible) colors.onPrimaryContainer else colors.onSurface,
         label = "statusContent"
     )
     val badgeColor by animateColorAsState(
-        if (isServiceRunning) colors.primary else colors.surfaceContainerHighest,
+        if (isWidgetVisible) colors.primary else colors.surfaceContainerHighest,
         label = "statusBadge"
     )
     val badgeIconColor by animateColorAsState(
-        if (isServiceRunning) colors.onPrimary else colors.onSurfaceVariant,
+        if (isWidgetVisible) colors.onPrimary else colors.onSurfaceVariant,
         label = "statusBadgeIcon"
     )
 
@@ -306,7 +518,7 @@ private fun ServiceStatusCard(isServiceRunning: Boolean, onToggle: (Boolean) -> 
             modifier = Modifier
                 .fillMaxWidth()
                 .toggleable(
-                    value = isServiceRunning,
+                    value = isWidgetVisible,
                     role = Role.Switch,
                     onValueChange = onToggle
                 )
@@ -322,7 +534,7 @@ private fun ServiceStatusCard(isServiceRunning: Boolean, onToggle: (Boolean) -> 
             ) {
                 Icon(
                     painter = painterResource(
-                        if (isServiceRunning) R.drawable.ic_volume_up else R.drawable.ic_volume_off
+                        if (isWidgetVisible) R.drawable.ic_volume_up else R.drawable.ic_volume_off
                     ),
                     contentDescription = null,
                     tint = badgeIconColor,
@@ -332,20 +544,20 @@ private fun ServiceStatusCard(isServiceRunning: Boolean, onToggle: (Boolean) -> 
             Spacer(modifier = Modifier.width(16.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = if (isServiceRunning) "Widget is on" else "Widget is off",
+                    text = if (isWidgetVisible) "Bubble is showing" else "Bubble is hidden",
                     style = MaterialTheme.typography.titleLarge
                 )
                 Spacer(modifier = Modifier.height(2.dp))
                 Text(
-                    text = if (isServiceRunning) "Floating above your other apps"
-                    else "Turn on to show the floating volume bubble",
+                    text = if (isWidgetVisible) "Floating above your other apps"
+                    else "The service stays on, ready to show it again",
                     style = MaterialTheme.typography.bodyMedium,
                     color = LocalContentColor.current.copy(alpha = 0.8f)
                 )
             }
             Spacer(modifier = Modifier.width(12.dp))
             // The whole row is the toggle target; the switch is visual only.
-            Switch(checked = isServiceRunning, onCheckedChange = null)
+            Switch(checked = isWidgetVisible, onCheckedChange = null)
         }
     }
 }
@@ -381,7 +593,7 @@ private fun AppearanceCard(prefs: WidgetPreferences) {
 
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
-                Text(text = "Opacity", style = MaterialTheme.typography.titleMedium)
+                Text(text = "Bubble opacity", style = MaterialTheme.typography.titleMedium)
                 SupportingText("${(opacity * 100).roundToInt()}%")
             }
             OpacityPreview(opacity)
@@ -393,7 +605,7 @@ private fun AppearanceCard(prefs: WidgetPreferences) {
             valueRange = WidgetPreferences.MIN_OPACITY..WidgetPreferences.MAX_OPACITY
         )
         Text(
-            text = "Applies the next time the widget opens or closes.",
+            text = "The volume panel always opens fully visible.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -483,17 +695,51 @@ private fun StreamsCard(prefs: WidgetPreferences) {
     }
 }
 
+/* ── Keep Running Card ─────────────────────────────────────────────── */
+
+/**
+ * Some OEM builds (Xiaomi HyperOS/MIUI in particular) kill background apps to
+ * save battery, which can also switch off the accessibility service. Exempting
+ * the app has to be done by the user from App info.
+ */
+@Composable
+private fun KeepRunningCard(onOpenAppInfo: () -> Unit, onOpenAutostart: () -> Unit) {
+    SettingsCard {
+        SupportingText(
+            "Some phones, such as Xiaomi, Redmi and POCO, close apps in the background " +
+                    "to save battery and may switch the service off. In App info, turn " +
+                    "on Autostart and set Battery saver to No restrictions. On Xiaomi, " +
+                    "also lock the app in Recent apps (long-press its card) so clearing " +
+                    "recent apps does not close it, and under Other permissions allow " +
+                    "\"Display pop-up windows while running in the background\" so the " +
+                    "panel's settings button can open this screen."
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        if (isXiaomi) {
+            Button(
+                onClick = onOpenAutostart,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Open Autostart settings") }
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+        OutlinedButton(
+            onClick = onOpenAppInfo,
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Open app info") }
+    }
+}
+
 /* ── Instructions Card ─────────────────────────────────────────────── */
 
 @Composable
 private fun InstructionsCard() {
     val steps = listOf(
-        "Turn the widget on. A floating bubble appears on screen.",
+        "Turn on the accessibility service. A floating bubble appears on screen.",
         "Tap the bubble to open the volume panel.",
         "Drag the bubble to move it. It snaps to the nearest edge.",
         "Drag a slider or use the buttons to change volume. Tap the speaker to mute.",
-        "The panel closes by itself after a few seconds without use.",
-        "Stop the widget here or from its notification."
+        "Tap anywhere outside the panel to close it. It also closes by itself after a few seconds without use.",
+        "Hide the bubble with the switch here. To turn the service off, use Accessibility settings."
     )
 
     SettingsCard {

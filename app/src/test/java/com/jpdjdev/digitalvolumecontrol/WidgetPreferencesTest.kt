@@ -2,6 +2,8 @@ package com.jpdjdev.digitalvolumecontrol
 
 import android.content.SharedPreferences
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -19,6 +21,13 @@ class WidgetPreferencesTest {
         assertEquals(ControlStyle.SLIDER, prefs.controlStyle)
         assertEquals(AudioStreamType.DEFAULTS, prefs.enabledStreams)
         assertEquals(WidgetPreferences.DEFAULT_OPACITY, prefs.widgetOpacity)
+        assertEquals(true, prefs.widgetVisible)
+    }
+
+    @Test
+    fun widgetVisibleRoundTrips() {
+        prefs.widgetVisible = false
+        assertEquals(false, prefs.widgetVisible)
     }
 
     @Test
@@ -50,6 +59,36 @@ class WidgetPreferencesTest {
         prefs.enabledStreams = setOf(AudioStreamType.RING)
         prefs.setStreamEnabled(AudioStreamType.RING, false)
         assertEquals(setOf(AudioStreamType.MEDIA), prefs.enabledStreams)
+    }
+
+    @Test
+    fun bubblePositionDefaults() {
+        assertEquals(false, prefs.bubbleDockedRight)
+        assertEquals(WidgetPreferences.DEFAULT_BUBBLE_Y_FRACTION, prefs.bubbleYFraction)
+    }
+
+    @Test
+    fun bubblePositionRoundTrips() {
+        prefs.saveBubblePosition(dockedRight = true, yFraction = 0.6f)
+        assertEquals(true, prefs.bubbleDockedRight)
+        assertEquals(0.6f, prefs.bubbleYFraction)
+    }
+
+    @Test
+    fun bubbleYFractionIsClamped() {
+        prefs.saveBubblePosition(dockedRight = false, yFraction = 3f)
+        assertEquals(1f, prefs.bubbleYFraction)
+        prefs.saveBubblePosition(dockedRight = false, yFraction = -1f)
+        assertEquals(0f, prefs.bubbleYFraction)
+    }
+
+    @Test
+    fun onlyPositionKeysAreReportedAsPositionKeys() {
+        assertTrue(WidgetPreferences.isPositionKey("bubble_y_fraction"))
+        assertTrue(WidgetPreferences.isPositionKey("bubble_docked_right"))
+        assertFalse(WidgetPreferences.isPositionKey(WidgetPreferences.KEY_WIDGET_VISIBLE))
+        // A null key means the preferences were cleared, so everything must be re-read.
+        assertFalse(WidgetPreferences.isPositionKey(null))
     }
 
     @Test

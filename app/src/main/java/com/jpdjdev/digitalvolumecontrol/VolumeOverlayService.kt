@@ -1,22 +1,23 @@
 package com.jpdjdev.digitalvolumecontrol
 
+import android.accessibilityservice.AccessibilityService
 import android.annotation.SuppressLint
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.graphics.PixelFormat
-import android.graphics.drawable.Icon
+import android.graphics.Rect
 import android.media.AudioManager
-import android.os.IBinder
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.ViewConfiguration
+import android.view.WindowInsets
 import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
 import androidx.annotation.DrawableRes
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
@@ -39,12 +40,15 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Settings
@@ -76,6 +80,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.res.painterResource
@@ -87,6 +92,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.setProgress
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -108,24 +114,44 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-class VolumeOverlayService : Service(),
+/**
+ * Hosts the floating widget as an accessibility overlay.
+ *
+ * An accessibility service is used instead of a foreground service with
+ * SYSTEM_ALERT_WINDOW because the system keeps it bound for as long as the
+ * user leaves it enabled, without an ongoing notification, and accessibility
+ * overlays do not trigger the system "displaying over other apps" notification.
+ * The service requests no accessibility events and cannot read window content
+ * (see res/xml/accessibility_service_config.xml); it only draws the widget.
+ */
+class VolumeOverlayService : AccessibilityService(),
     LifecycleOwner, ViewModelStoreOwner, SavedStateRegistryOwner {
 
     companion object {
         private val _isRunning = MutableStateFlow(false)
 
-        /** Whether the widget service is currently running; observed by [MainActivity]. */
+        /** Whether the accessibility service is connected; observed by [MainActivity]. */
         val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
 
+        /**
+         * Whether the user has switched the service on in Accessibility settings.
+         * This stays true after the process dies, so on while not [isRunning]
+         * means the system lost the service (crash, or killed in the background).
+         */
+        fun isEnabledInSettings(context: Context): Boolean {
+            val enabled = Settings.Secure.getString(
+                context.contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            ) ?: return false
+            val self = ComponentName(context, VolumeOverlayService::class.java)
+            return enabled.split(':').any { ComponentName.unflattenFromString(it) == self }
+        }
+
         private const val TAG = "VolumeOverlay"
-        private const val NOTIFICATION_CHANNEL_ID = "volume_overlay_channel"
-        private const val NOTIFICATION_ID = 1001
-        const val ACTION_STOP = "com.jpdjdev.digitalvolumecontrol.action.STOP"
 
         /** Collapsed bubble size — must match [CollapsedBubble]. */
         private const val BUBBLE_SIZE_DP = 48
         private const val EDGE_MARGIN_DP = 8
-        private const val DRAG_SLOP_DP = 4
     }
 
     /* ── Android system services ───────────────────────────────────── */
@@ -153,11 +179,34 @@ class VolumeOverlayService : Service(),
     /** Which screen edge the widget is docked to; decided when a drag ends. */
     private var dockedRight = false
 
+    /**
+     * Set when the panel closes. A tall panel near the bottom is pushed up to
+     * fit on screen, so once it has shrunk back to the bubble (see the layout
+     * listener) the bubble returns to its saved position.
+     */
+    private var restoreYOnShrink = false
+
+    /** Tallest the panel may grow: the screen height between the system bars. */
+    private val maxPanelHeight = mutableStateOf(Dp.Unspecified)
+
+    private lateinit var prefs: WidgetPreferences
+
+    /** Settings shown by the widget, refreshed whenever a preference changes. */
+    private val widgetSettings = mutableStateOf(WidgetSettings())
+
+    // Held in a field: SharedPreferences only keeps a weak reference to it.
+    // The key is null when preferences are cleared, so that re-reads everything.
+    private val prefsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        // Written by this service at the end of every drag; nothing to refresh.
+        if (WidgetPreferences.isPositionKey(key)) return@OnSharedPreferenceChangeListener
+        widgetSettings.value = WidgetSettings.from(prefs)
+        applyVisibility()
+    }
+
     /* ── Service lifecycle ─────────────────────────────────────────── */
 
     override fun onCreate() {
         super.onCreate()
-        _isRunning.value = true
 
         // Lifecycle setup — direct extension functions, no reflection.
         lifecycleRegistry = LifecycleRegistry(this)
@@ -166,44 +215,57 @@ class VolumeOverlayService : Service(),
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+    }
 
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        // A repeated connect would otherwise add a second, unremovable overlay.
+        if (::overlayView.isInitialized) return
 
-        createNotificationChannel()
+        // An exception escaping this method kills the process; the system then
+        // reports the service as "not working" and stops restarting it, which
+        // the user sees as the switch turning on and immediately failing. Keep
+        // the service alive instead; MainActivity shows it as not running.
+        try {
+            // Fetched after connecting so the WindowManager carries the
+            // accessibility window token required for TYPE_ACCESSIBILITY_OVERLAY.
+            windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            prefs = WidgetPreferences(this)
+            widgetSettings.value = WidgetSettings.from(prefs)
 
-        // Show the overlay *before* going foreground: on Android 15+ an app that
-        // relies on SYSTEM_ALERT_WINDOW may only start a foreground service from
-        // the background (e.g. a START_STICKY restart) while its overlay is visible.
-        val overlayShown = setupOverlayView()
-        val inForeground = try {
-            startForeground(NOTIFICATION_ID, createNotification())
-            true
+            setupOverlayView()
+            prefs.registerChangeListener(prefsListener)
+            applyVisibility()
+            _isRunning.value = true
         } catch (e: Exception) {
-            Log.w(TAG, "Unable to start foreground service", e)
-            false
+            Log.e(TAG, "Failed to set up the overlay", e)
         }
-        if (!overlayShown || !inForeground) stopSelf()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
-        return START_STICKY
-    }
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+
+    override fun onInterrupt() = Unit
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        if (!::overlayView.isInitialized) return
         // Screen size changes on rotation / fold — keep the widget on screen.
-        if (::overlayView.isInitialized) applyDock()
+        updateMaxPanelHeight()
+        if (!widgetExpanded.value) restoreSavedPosition()
+        applyDock()
     }
 
     override fun onDestroy() {
         _isRunning.value = false
+        if (::prefs.isInitialized) prefs.unregisterChangeListener(prefsListener)
 
-        // Lifecycle teardown
+        // Remove the window first so the composition is disposed while its
+        // lifecycle is still alive, rather than after ON_DESTROY.
+        if (::overlayView.isInitialized && overlayView.isAttachedToWindow) {
+            try { windowManager.removeViewImmediate(overlayView) } catch (_: Exception) { }
+        }
+
         try {
             lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
             lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
@@ -212,74 +274,27 @@ class VolumeOverlayService : Service(),
 
         try { _viewModelStore.clear() } catch (_: Exception) { }
 
-        if (::overlayView.isInitialized && overlayView.isAttachedToWindow) {
-            try { windowManager.removeView(overlayView) } catch (_: Exception) { }
-        }
         super.onDestroy()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    /* ── Notification ──────────────────────────────────────────────── */
-
-    private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            NOTIFICATION_CHANNEL_ID,
-            "Volume Control Widget",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Keeps the floating volume widget active"
-            setShowBadge(false)
-        }
-        getSystemService(NotificationManager::class.java)
-            .createNotificationChannel(channel)
-    }
-
-    private fun createNotification(): Notification {
-        val openIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val stopIntent = PendingIntent.getService(
-            this, 1,
-            Intent(this, VolumeOverlayService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_IMMUTABLE
-        )
-        return Notification.Builder(this, NOTIFICATION_CHANNEL_ID).apply {
-            setContentTitle("Volume Control Active")
-            setContentText("Tap to open settings")
-            setSmallIcon(R.drawable.ic_volume_up)
-            setContentIntent(openIntent)
-            addAction(
-                Notification.Action.Builder(
-                    Icon.createWithResource(this@VolumeOverlayService, R.drawable.ic_volume_off),
-                    "Stop",
-                    stopIntent
-                ).build()
-            )
-            setOngoing(true)
-        }.build()
     }
 
     /* ── Overlay setup ─────────────────────────────────────────────── */
 
-    /** Adds the floating widget window. Returns false if it could not be shown. */
+    /** Creates the floating widget view; [applyVisibility] adds it to the screen. */
     // Accessibility: TalkBack activates the bubble through its Compose semantics
     // onClick (see CollapsedBubble), so the raw touch listener needs no performClick.
     @SuppressLint("ClickableViewAccessibility")
-    private fun setupOverlayView(): Boolean {
+    private fun setupOverlayView() {
         windowParams = WindowManager.LayoutParams().apply {
             width = WindowManager.LayoutParams.WRAP_CONTENT
             height = WindowManager.LayoutParams.WRAP_CONTENT
-            type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            type = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
             flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
             format = PixelFormat.TRANSLUCENT
             gravity = Gravity.TOP or Gravity.START
-            x = dp(EDGE_MARGIN_DP)
-            y = dp(160)
         }
+        restoreSavedPosition()
+        updateMaxPanelHeight()
 
         overlayView = ComposeView(this).apply {
             // Modern direct extension functions — no reflection needed.
@@ -287,10 +302,18 @@ class VolumeOverlayService : Service(),
             setViewTreeViewModelStoreOwner(this@VolumeOverlayService)
             setViewTreeSavedStateRegistryOwner(this@VolumeOverlayService)
 
-            // Expanding/collapsing changes the widget width; re-dock so the
+            // Expanding/collapsing changes the widget size; re-dock so the
             // panel grows away from the edge and never spills off screen.
-            addOnLayoutChangeListener { _, left, _, right, _, oldLeft, _, oldRight, _ ->
-                if (right - left != oldRight - oldLeft) post { applyDock() }
+            addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+                val resized = right - left != oldRight - oldLeft ||
+                        bottom - top != oldBottom - oldTop
+                if (resized) post {
+                    if (restoreYOnShrink && !widgetExpanded.value) {
+                        restoreYOnShrink = false
+                        restoreSavedPosition()
+                    }
+                    applyDock()
+                }
             }
 
             /* ── Touch handling ─────────────────────────────────────
@@ -299,45 +322,60 @@ class VolumeOverlayService : Service(),
              * EXPANDED:  return false immediately → Compose handles
              *            sliders, buttons, mute toggles.
              * ───────────────────────────────────────────────────── */
-            var startX = 0f
-            var startY = 0f
-            var hasMoved = false
-            val dragSlop = dp(DRAG_SLOP_DP)
+            // Positions are taken relative to the touch-down point, not summed
+            // per event, so rounding never makes the bubble drift off the finger.
+            var downRawX = 0f
+            var downRawY = 0f
+            var downX = 0
+            var downY = 0
+            var dragging = false
+            val dragSlop = ViewConfiguration.get(this@VolumeOverlayService).scaledTouchSlop
 
             setOnTouchListener { _, event ->
+                // Only delivered while expanded (FLAG_WATCH_OUTSIDE_TOUCH);
+                // a tap anywhere else on screen closes the panel.
+                if (event.actionMasked == MotionEvent.ACTION_OUTSIDE) {
+                    collapse()
+                    return@setOnTouchListener true
+                }
+
                 // When expanded, pass every event through to Compose.
                 if (widgetExpanded.value) return@setOnTouchListener false
 
-                when (event.action) {
+                when (event.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
-                        startX = event.rawX
-                        startY = event.rawY
-                        hasMoved = false
+                        downRawX = event.rawX
+                        downRawY = event.rawY
+                        downX = windowParams.x
+                        downY = windowParams.y
+                        dragging = false
                         true
                     }
 
                     MotionEvent.ACTION_MOVE -> {
-                        val dx = event.rawX - startX
-                        val dy = event.rawY - startY
-                        if (abs(dx) > dragSlop || abs(dy) > dragSlop) {
-                            hasMoved = true
-                            windowParams.x += dx.toInt()
-                            windowParams.y += dy.toInt()
+                        val dx = event.rawX - downRawX
+                        val dy = event.rawY - downRawY
+                        if (!dragging && (abs(dx) > dragSlop || abs(dy) > dragSlop)) {
+                            dragging = true
+                        }
+                        if (dragging) {
+                            windowParams.x = downX + dx.roundToInt()
+                            windowParams.y = downY + dy.roundToInt()
                             clampToScreen()
                             updateLayout()
-                            startX = event.rawX
-                            startY = event.rawY
                         }
                         true
                     }
 
                     MotionEvent.ACTION_UP -> {
-                        if (hasMoved) {
-                            snapToEdge()
-                        } else {
-                            // Tap → expand
-                            widgetExpanded.value = true
-                        }
+                        if (dragging) snapToEdge() else expand()
+                        true
+                    }
+
+                    // The system can cancel a drag mid-way (e.g. a system
+                    // gesture); dock anyway so the bubble is not left floating.
+                    MotionEvent.ACTION_CANCEL -> {
+                        if (dragging) snapToEdge()
                         true
                     }
 
@@ -347,36 +385,74 @@ class VolumeOverlayService : Service(),
 
             setContent {
                 FloatingVolumeTheme {
-                    val prefs = remember { WidgetPreferences(this@VolumeOverlayService) }
                     VolumeWidget(
                         audioManager = audioManager,
-                        prefs = prefs,
+                        settings = widgetSettings.value,
                         isExpanded = widgetExpanded.value,
-                        onExpand = { widgetExpanded.value = true },
-                        onCollapse = { widgetExpanded.value = false },
-                        onOpenApp = {
-                            startActivity(
-                                Intent(
-                                    this@VolumeOverlayService,
-                                    MainActivity::class.java
-                                ).apply {
-                                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or
-                                            Intent.FLAG_ACTIVITY_CLEAR_TOP
-                                }
-                            )
-                        }
+                        maxPanelHeight = maxPanelHeight.value,
+                        onExpand = ::expand,
+                        onCollapse = ::collapse,
+                        onOpenApp = ::openApp
                     )
                 }
             }
         }
 
-        return try {
-            windowManager.addView(overlayView, windowParams)
-            true
+    }
+
+    private fun openApp() {
+        // Close first so the panel does not sit on top of the settings screen.
+        collapse()
+        try {
+            startActivity(
+                Intent(this, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                }
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to add overlay view", e)
-            false
+            Log.w(TAG, "Could not open the app", e)
         }
+    }
+
+    /** Adds or removes the widget window to match the user's show/hide setting. */
+    private fun applyVisibility() {
+        if (prefs.widgetVisible) {
+            if (overlayView.isAttachedToWindow) return
+            // Position before adding so the bubble does not appear at 0,0 first.
+            applyDock()
+            try {
+                windowManager.addView(overlayView, windowParams)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to add overlay view", e)
+            }
+        } else {
+            // Reopen as the bubble, not the panel, next time it is shown.
+            collapse()
+            if (!overlayView.isAttachedToWindow) return
+            try { windowManager.removeView(overlayView) } catch (_: Exception) { }
+        }
+    }
+
+    private fun expand() {
+        if (widgetExpanded.value) return
+        restoreYOnShrink = false
+        // Outside touches are only watched while the panel is open, so the
+        // collapsed bubble is not woken up by every tap on the screen.
+        windowParams.flags = windowParams.flags or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+        updateLayout()
+        widgetExpanded.value = true
+    }
+
+    private fun collapse() {
+        if (!widgetExpanded.value) return
+        windowParams.flags = windowParams.flags and
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH.inv()
+        updateLayout()
+        // The window keeps the panel's size until the exit animation finishes,
+        // so the position is restored by the layout listener, not here.
+        restoreYOnShrink = true
+        widgetExpanded.value = false
     }
 
     /* ── Positioning helpers ───────────────────────────────────────── */
@@ -387,23 +463,59 @@ class VolumeOverlayService : Service(),
 
     private fun widgetHeight(): Int = overlayView.height.takeIf { it > 0 } ?: dp(BUBBLE_SIZE_DP)
 
+    /**
+     * Screen area outside the status bar, navigation bar and display cutout,
+     * so the bubble never covers the clock or blocks the home gesture.
+     */
+    private fun screenArea(): Rect = try {
+        val metrics = windowManager.currentWindowMetrics
+        val insets = metrics.windowInsets.getInsetsIgnoringVisibility(
+            WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout()
+        )
+        val bounds = metrics.bounds
+        Rect(insets.left, insets.top, bounds.width() - insets.right, bounds.height() - insets.bottom)
+    } catch (e: Exception) {
+        Log.w(TAG, "Window metrics unavailable; using the display size", e)
+        val display = resources.displayMetrics
+        Rect(0, 0, display.widthPixels, display.heightPixels)
+    }
+
+    /** Vertical range the collapsed bubble can move in. */
+    private fun bubbleTravel(area: Rect): Int = (area.height() - dp(BUBBLE_SIZE_DP)).coerceAtLeast(1)
+
+    private fun restoreSavedPosition() {
+        val area = screenArea()
+        dockedRight = prefs.bubbleDockedRight
+        windowParams.y = area.top + (prefs.bubbleYFraction * bubbleTravel(area)).roundToInt()
+    }
+
+    private fun updateMaxPanelHeight() {
+        maxPanelHeight.value = (screenArea().height() / resources.displayMetrics.density).dp
+    }
+
     private fun clampToScreen() {
-        val bounds = windowManager.currentWindowMetrics.bounds
-        windowParams.x = windowParams.x.coerceIn(0, (bounds.width() - widgetWidth()).coerceAtLeast(0))
-        windowParams.y = windowParams.y.coerceIn(0, (bounds.height() - widgetHeight()).coerceAtLeast(0))
+        val area = screenArea()
+        windowParams.x = windowParams.x.coerceIn(
+            area.left, (area.right - widgetWidth()).coerceAtLeast(area.left)
+        )
+        windowParams.y = windowParams.y.coerceIn(
+            area.top, (area.bottom - widgetHeight()).coerceAtLeast(area.top)
+        )
     }
 
     /** Called when a drag ends: dock to whichever edge the bubble centre is nearer. */
     private fun snapToEdge() {
-        val bounds = windowManager.currentWindowMetrics.bounds
-        dockedRight = windowParams.x + widgetWidth() / 2 > bounds.width() / 2
+        val area = screenArea()
+        dockedRight = windowParams.x + widgetWidth() / 2 > area.centerX()
         applyDock()
+        val yFraction = (windowParams.y - area.top).toFloat() / bubbleTravel(area)
+        prefs.saveBubblePosition(dockedRight, yFraction)
     }
 
     private fun applyDock() {
-        val bounds = windowManager.currentWindowMetrics.bounds
+        val area = screenArea()
         val margin = dp(EDGE_MARGIN_DP)
-        windowParams.x = if (dockedRight) bounds.width() - widgetWidth() - margin else margin
+        windowParams.x = if (dockedRight) area.right - widgetWidth() - margin else area.left + margin
         clampToScreen()
         updateLayout()
     }
@@ -418,20 +530,34 @@ class VolumeOverlayService : Service(),
  *  COMPOSABLES — Widget UI
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/** Snapshot of the preferences the widget renders from. */
+private data class WidgetSettings(
+    val controlStyle: ControlStyle = ControlStyle.SLIDER,
+    val streams: List<AudioStreamType> = AudioStreamType.DEFAULTS.toList(),
+    val opacity: Float = WidgetPreferences.DEFAULT_OPACITY
+) {
+    companion object {
+        fun from(prefs: WidgetPreferences) = WidgetSettings(
+            controlStyle = prefs.controlStyle,
+            streams = prefs.enabledStreams.sortedBy { it.ordinal },
+            opacity = prefs.widgetOpacity
+        )
+    }
+}
+
+/** The panel closes after this long without a touch. */
+private const val AUTO_COLLAPSE_MS = 8_000L
+
 @Composable
 private fun VolumeWidget(
     audioManager: AudioManager,
-    prefs: WidgetPreferences,
+    settings: WidgetSettings,
     isExpanded: Boolean,
+    maxPanelHeight: Dp,
     onExpand: () -> Unit,
     onCollapse: () -> Unit,
     onOpenApp: () -> Unit
 ) {
-    // Re-read preferences each time expansion state changes.
-    val controlStyle = remember(isExpanded) { prefs.controlStyle }
-    val streams = remember(isExpanded) { prefs.enabledStreams.toList().sortedBy { it.ordinal } }
-    val opacity = remember(isExpanded) { prefs.widgetOpacity }
-
     Box {
         // ── Collapsed bubble ─────────────────────────────────────
         // Always composed but only visible when collapsed, so the
@@ -441,7 +567,7 @@ private fun VolumeWidget(
             enter = fadeIn(tween(200)) + scaleIn(tween(200), initialScale = 0.6f),
             exit = fadeOut(tween(150)) + scaleOut(tween(150), targetScale = 0.6f)
         ) {
-            CollapsedBubble(opacity = opacity, onExpand = onExpand)
+            CollapsedBubble(opacity = settings.opacity, onExpand = onExpand)
         }
 
         // ── Expanded panel ───────────────────────────────────────
@@ -452,9 +578,9 @@ private fun VolumeWidget(
         ) {
             ExpandedPanel(
                 audioManager = audioManager,
-                streams = streams,
-                controlStyle = controlStyle,
-                opacity = opacity,
+                streams = settings.streams,
+                controlStyle = settings.controlStyle,
+                maxHeight = maxPanelHeight,
                 onCollapse = onCollapse,
                 onOpenApp = onOpenApp
             )
@@ -503,14 +629,17 @@ private fun ExpandedPanel(
     audioManager: AudioManager,
     streams: List<AudioStreamType>,
     controlStyle: ControlStyle,
-    opacity: Float,
+    maxHeight: Dp,
     onCollapse: () -> Unit,
     onOpenApp: () -> Unit
 ) {
-    // Auto-collapse timer — resets on any user interaction.
+    // Auto-collapse timer: paused while a finger is on the panel, restarted
+    // when it lifts or a volume changes (TalkBack adjusts without touches).
     var lastInteraction by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(lastInteraction) {
-        delay(8000)
+    var touching by remember { mutableStateOf(false) }
+    LaunchedEffect(lastInteraction, touching) {
+        if (touching) return@LaunchedEffect
+        delay(AUTO_COLLAPSE_MS)
         onCollapse()
     }
 
@@ -521,10 +650,28 @@ private fun ExpandedPanel(
         ControlStyle.BUTTONS -> Modifier.width(220.dp)
     }
 
+    // Opacity applies only to the idle bubble; the open panel stays opaque so
+    // its controls are readable over any background.
     Surface(
         modifier = Modifier
             .widthIn(min = 168.dp)
-            .graphicsLayer { alpha = opacity },
+            .heightIn(max = maxHeight)
+            // Watches touches on the Initial pass without consuming them, so the
+            // sliders and buttons inside still receive every event.
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                    touching = true
+                    try {
+                        do {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                        } while (event.changes.any { it.pressed })
+                    } finally {
+                        touching = false
+                        lastInteraction = System.currentTimeMillis()
+                    }
+                }
+            },
         shape = RoundedCornerShape(24.dp),
         color = MaterialTheme.colorScheme.surfaceContainer,
         border = BorderStroke(
@@ -569,8 +716,15 @@ private fun ExpandedPanel(
             Spacer(modifier = Modifier.height(8.dp))
 
             // The header has asymmetric padding to align its icon buttons with
-            // the edge; re-balance it so the controls sit centred.
-            Box(modifier = Modifier.padding(end = 8.dp)) {
+            // the edge; re-balance it so the controls sit centred. The controls
+            // scroll when they are taller than the screen (e.g. five button rows
+            // in landscape) while the header stays in place.
+            Box(
+                modifier = Modifier
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState())
+                    .padding(end = 8.dp)
+            ) {
                 when (controlStyle) {
                     ControlStyle.SLIDER -> SliderControls(
                         audioManager = audioManager,
@@ -737,7 +891,7 @@ private fun StreamSliderColumn(
         modifier = Modifier.width(48.dp)
     ) {
         Text(
-            text = "${state.percent}",
+            text = "${state.percent}%",
             style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurface
